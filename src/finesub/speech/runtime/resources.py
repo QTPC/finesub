@@ -23,6 +23,10 @@ The card's nominal size appears in exactly one place, and only for a moment:
 estimate how much is actually free, then matches that. Nothing downstream ever
 sees it.
 
+On an Intel GPU even that one moment is different: the figure the driver reports
+is shared system memory, not dedicated VRAM, so `auto` stops a rung earlier
+(`XPU_AUTO_TIER_CEILING`). See `tier_for_vram` for the reasoning.
+
 There is deliberately **no soft cap**. CT2 answers a CUDA OOM with a
 process-level abort, so a limit the pipeline pretended to enforce would be a
 promise it cannot keep (`ASR_DECODE_BATCH_BY_TIER` records the same reasoning
@@ -85,6 +89,22 @@ GPU_RESERVE_FLOOR_GB = 0.5
 #: tiers, so the ceiling can give the headroom without the slower worker.
 AUTO_TIER_CEILING = "standard_large_vram"
 AUTO_CEILING_LIFT_CAPACITY_GB = 24
+
+#: The largest tier `auto` will pick on an Intel GPU, whatever size it reports.
+#:
+#: An Intel graphics adapter has no VRAM of its own: `total_memory` is a slice
+#: of system RAM, shared with the OS, the browser, and every separator block
+#: still in host memory. So the figure is not a budget in the sense this table
+#: means, and the two rungs above `standard` are exactly the ones that spend it:
+#: `standard_large_vram` and `high` hand the referee enough headroom to take its
+#: compiled decode path -- a claim nothing has ever measured on Intel hardware,
+#: and the pipeline has no acceptance record there at all. `standard` (2
+#: separators, the measured throughput peak, and a budget the referee can only
+#: spend as headroom) is the widest claim `auto` should make on this vendor.
+#:
+#: `--gpu-tier` is unaffected: a user who knows their machine may still name
+#: `high`. This is a ceiling on `auto`'s guess, never on the option.
+XPU_AUTO_TIER_CEILING = "standard"
 
 #: System RAM the pipeline is checked against, in GiB. One figure for every
 #: tier -- but **not** because RAM is tier-independent. It is not: separator
@@ -326,6 +346,15 @@ def tier_for_vram(total_gib: float) -> str:
     measurably slower than `standard`'s second, so promoting a 16GB card would
     hand it a slower run for owning a bigger card.
 
+    **And on an Intel GPU, stop at `standard` regardless of the reported size.**
+    Its `total_memory` is shared system memory, not dedicated VRAM: the figure
+    is not the exclusive budget this table's numbers mean, and the two tiers
+    above `standard` exist to spend headroom (`standard_large_vram` gives the
+    referee its compiled decode path). Nothing has measured that on Intel
+    hardware, so `auto` makes the smaller claim (`XPU_AUTO_TIER_CEILING`).
+    `--gpu-tier` is never routed through here, so naming `high` by hand still
+    works.
+
     Below the smallest tier there is nothing to fall back to (4GB is already the
     documented minimum), so a smaller card gets `entry` and finds out from the
     OOM, exactly as it did when the tier was picked by hand. Above the largest
@@ -338,29 +367,48 @@ def tier_for_vram(total_gib: float) -> str:
     # `<=` and not `<`: the curve is built to land exactly on the tier figures
     # at 4/8/12GB, so a strict comparison would drop every nominal card a rung.
     tiers = gpu_backed_tiers()
+    names = [spec.name for spec in tiers]
     fits = [index for index, spec in enumerate(tiers) if spec.usable_gib <= free]
     chosen = fits[-1] if fits else 0
     if nominal < AUTO_CEILING_LIFT_CAPACITY_GB:
-        chosen = min(chosen, [spec.name for spec in tiers].index(AUTO_TIER_CEILING))
+        chosen = min(chosen, names.index(AUTO_TIER_CEILING))
+    from .device import gpu_device
+
+    # ⚠ This reads the machine even though the rest of the function is a pure
+    # function of `total_gib`. That is deliberate and bounded: the only caller
+    # is `detect_gpu_tier`, which passes this machine's real figure, and the
+    # Intel rule is a statement about *this* machine's memory ("shared with the
+    # system, so the number is not dedicated VRAM"). Do not call it with a
+    # hypothetical capacity and expect a machine-independent answer; a `device`
+    # parameter was considered and rejected because it would have to be
+    # threaded through every test for one rule.
+    if gpu_device() == "xpu":
+        chosen = min(chosen, names.index(XPU_AUTO_TIER_CEILING))
     return tiers[chosen].name
 
 
 def check_tier_device_agreement(gpu_tier: str, device: str | None) -> None:
-    """Refuse `--gpu-tier cpu --device cuda`, which asks for both at once.
+    """Refuse ``--gpu-tier cpu --device cuda`` (or ``xpu``), which asks for both.
 
     Silently honouring one of them is how the next silent misconfiguration
-    happens: the tier is a policy ("do not use the GPU") and `--device cuda` is
-    a request to use it, so there is no reading under which both hold. The
-    other direction needs no check -- a GPU tier with `--device cpu` is the
-    ordinary "leave the card alone this run", and every stage already reports
-    the CPU it settled on.
+    happens: the tier is a policy ("do not use the GPU") and an accelerator
+    request is a request to use it, so there is no reading under which both
+    hold. `is_gpu_device` rather than a ``cuda`` prefix test, or an ``xpu``
+    request would slip past the one check that exists for exactly that
+    combination.
+
+    The other direction needs no check -- a GPU tier with ``--device cpu`` is
+    the ordinary "leave the card alone this run", and every stage already
+    reports the CPU it settled on.
     """
 
     if not gpu_tier or not device or gpu_tier == AUTO_GPU_TIER:
         return
-    wants_cuda = str(device).strip().lower().startswith("cuda")
+    from .device import is_gpu_device
+
+    wants_gpu = is_gpu_device(device)
     profile = RESOURCE_PROFILES.get(gpu_tier)
-    if wants_cuda and profile is not None and not profile.gpu:
+    if wants_gpu and profile is not None and not profile.gpu:
         raise ValueError(
             f"--gpu-tier {gpu_tier} means this run does not use the GPU, but "
             f"--device {device} asks for it. Pick one: drop --device to let the "
@@ -378,23 +426,46 @@ def detect_gpu_tier(*, announce_unused_card: bool = True) -> str:
     that torch cannot use -- there the CPU tier is the correct tier for an
     environment that is broken, and nothing else on screen says so (owner
     2026-09-17).
+
+    The gate is *presence*, `gpu_device_present()`, not `gpu_device()`. Two
+    facts sit between the two and they point opposite ways here: Intel is why
+    the usable token exists (on an XPU build the CUDA side answers "no card"
+    forever, so a CUDA-shaped gate would pin every Intel machine to the CPU
+    tier and make the XPU support inert), while a card too old for this torch
+    build is *present and unusable* -- and that machine must still get a GPU
+    tier. The `cpu` tier is not just a label: it turns ``resource_profile.gpu``
+    off, which disables ``resolve_asr_device(..., gpu_allowed=False)``, and the
+    patched CTranslate2 is a separate binary with its own arch list that may
+    well run that card. Folding torch's verdict into the tier would decide that
+    for every stage at once. So the CPU tier is kept for "the driver reports no
+    card at all"; a card this build cannot size falls through to
+    `DEFAULT_GPU_TIER` via ``total_vram_gib() is None``, as it did before Intel.
+
+    ⚠ One case looks like that fall-through and is not: a stock PyPI ``torch``
+    on an Intel machine answers **no presence** -- there is no ``torch.xpu`` to
+    enumerate a card with, so nothing reports the card that the driver does
+    have. That machine takes the CPU tier and the unused-card warning, which is
+    the right help; only a card that *is* reported but cannot be sized (CUDA
+    card too old for this build) lands on `DEFAULT_GPU_TIER`.
     """
 
     from .device import (
-        cuda_device_present,
+        gpu_device,
+        gpu_device_present,
         total_vram_gib,
         warn_if_an_installed_card_is_unused,
     )
 
-    if not cuda_device_present():
-        # No card torch can reach -- a GPU tier would be a claim about hardware
-        # it cannot back. This is the policy branch, and it is the ONLY one.
+    if not gpu_device() and not gpu_device_present():
+        # Only a machine whose driver reports no card at all is a CPU machine:
+        # anything else has hardware another backend might reach. This is the
+        # policy branch, and it is the ONLY one.
         if announce_unused_card:
             warn_if_an_installed_card_is_unused()
         return CPU_TIER
     total = total_vram_gib()
     if total is None:
-        # A card exists but this PyTorch build cannot size it (too old for its
+        # A card exists but this torch build cannot size it (too old for its
         # kernels). Still a GPU tier on purpose: another backend may run on it,
         # and folding torch's verdict into the tier would decide that for every
         # stage at once. The smallest rung is the honest guess -- the torch
@@ -504,21 +575,23 @@ def warn_if_vram_is_short(
     owed is the fact, not a second-guess.
 
     Silent when the run is not going to the GPU at all -- either because no
-    usable CUDA device answers (that machine is on the CPU path and
+    usable accelerator answers (that machine is on the CPU path and
     `resolve_device` already said so) or because the user asked for `--device
     cpu` on a machine that *has* one. The second is the easy one to get wrong:
     the card is perfectly visible, so a check that only asks the driver would
-    warn about VRAM for a run that will not touch it.
+    warn about VRAM for a run that will not touch it. `is_gpu_device` and not a
+    ``cuda`` prefix test, or an ``xpu`` run would skip the check that exists to
+    tell it its card is full.
     """
 
-    from .device import free_vram_gib
+    from .device import device_type, free_vram_gib, is_gpu_device
 
     if not profile.gpu:
         # The tier says this run does not use the GPU. Warning about free VRAM
         # would be answering a question nobody asked -- and this replaces the
         # hardcoded "unless there is no CUDA" branch that used to live here.
         return
-    if device is not None and not str(device).strip().lower().startswith("cuda"):
+    if device is not None and not is_gpu_device(device):
         return
 
     free = free_vram_gib()
@@ -531,12 +604,22 @@ def warn_if_vram_is_short(
     # the tier the user is already on is the least useful thing to say in
     # exactly the case where they most need a way out.
     downgrade = "" if profile.gpu_tier == smallest else f"改用 --gpu-tier {smallest}，"
+    if device_type(device) == "xpu":
+        # Intel runs CT2 on the CPU by design (no Intel GPU backend), so the
+        # CUDA sentence would name a failure this run cannot have. What an
+        # Intel OOM actually does is knock the torch stages back to the CPU.
+        impact = (
+            "可能显存不足而中断；人声分离与裁判会退回 CPU 或变慢"
+            "（CTranslate2 没有 Intel GPU 后端，ASR 本来就在 CPU）"
+        )
+    else:
+        impact = "可能显存不足而中断；CT2 遇 CUDA OOM 是进程级中止，接不住"
     current_reporter().warning(
         "gpu-vram-short",
         f"{stage}: the {profile.gpu_tier} tier expects "
         f"{profile.usable_gib:.2f} GiB of free VRAM, but only "
         f"{free:.2f} GiB is free right now.",
-        impact="可能显存不足而中断；CT2 遇 CUDA OOM 是进程级中止，接不住",
+        impact=impact,
         action=f"关掉占用显存的程序，{downgrade}实在不行用 --device cpu（慢但能跑完）",
     )
 

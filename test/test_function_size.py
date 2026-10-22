@@ -106,7 +106,13 @@ _ALLOWED: dict[str, int] = {
     # `_run_speaker_export_stage`, the warning when it cannot run in
     # `_warn_if_the_judge_cannot_run`. (The role layer that took two lines here
     # went when the judge replaced it.)
-    "finesub/stages.py:run_pipeline": 447,
+    # 453 not 447 since 2026-10-22: Intel GPU support refuses a device spelling
+    # no stage can honour before the run starts, so `--device cuda:0` no longer
+    # pays for the whole separation pass and then raises. Six lines: the lazy
+    # import the other device helpers in this file already use, the call, and
+    # the note saying why the check sits ahead of separation instead of inside
+    # the first resolver that happens to see the string.
+    "finesub/stages.py:run_pipeline": 453,
     # 429 not 414 since 2026-09-03: `--separate/--no-separate`. This function is
     # a flat list of `add_argument` calls, so every new user-facing option costs
     # it a block and no split makes it smaller -- splitting by topic would just
@@ -139,7 +145,11 @@ _ALLOWED: dict[str, int] = {
     # which would quietly re-permit those eight lines.
     "finesub/llm/task_report.py:render_task_report": 395,
     "finesub/llm/output_protocol.py:validate_translated_csv_text": 385,
-    "finesub/speech/preprocessing/separator/separation.py:run_vocal_separation": 377,
+    # 379 not 377 since 2026-10-22: the separator's real placement is read back
+    # off the wrapper after the build, and a run that lands on the CPU asks the
+    # block plan for one worker -- two lines for a decision the plan used to be
+    # made without. Recording, not waiving: the number still has to move by hand.
+    "finesub/speech/preprocessing/separator/separation.py:run_vocal_separation": 379,
     # 365 not 385 since 2026-09-10: the soft/hard API timeout would have pushed
     # this past 385, so the per-attempt transport dispatch moved out to
     # `_generate_once` and the loop shrank instead. (The 2026-09-03 note here

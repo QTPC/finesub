@@ -47,6 +47,37 @@ def _fake_separator() -> SimpleNamespace:
     )
 
 
+def _fake_gpu(monkeypatch, family: str | None = "cuda") -> None:
+    """Pin the stage's view of the machine to this test's answer.
+
+    ``separation`` imports the device helpers by name, so the family the stage
+    resolves is read from these copies. All four are patched together because
+    they answer one question: left real, `device_type(None)` asks the host --
+    "no GPU" on a CPU-only CI box, "xpu" on the Intel one -- and the fake would
+    mean different machines on different runners. ``family=None`` means "no
+    usable GPU".
+    """
+
+    machine = family or ""
+
+    def fake_device_type(device: str | None) -> str:
+        text = str(machine if device is None else device).strip().lower()
+        if text.startswith("cuda"):
+            return "cuda"
+        if text.startswith("xpu"):
+            return "xpu"
+        return "cpu"
+
+    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: family == "cuda")
+    monkeypatch.setattr(vocal_separation, "xpu_usable", lambda: family == "xpu")
+    monkeypatch.setattr(vocal_separation, "device_type", fake_device_type)
+    monkeypatch.setattr(
+        vocal_separation,
+        "is_gpu_device",
+        lambda device=None: fake_device_type(device) != "cpu",
+    )
+
+
 def test_shared_separator_clone_isolates_state_but_reuses_model() -> None:
     master = _fake_separator()
 
@@ -76,13 +107,14 @@ def test_shared_separator_pool_loads_once_for_concurrent_leases(monkeypatch) -> 
     barrier = threading.Barrier(3)
     pool = vocal_separation._SharedSeparatorPool()
 
-    def fake_build(output_dir: str, output_format: str, batch_size: int, *, use_cuda: bool):
+    def fake_build(output_dir: str, output_format: str, batch_size: int, *, device: str):
         nonlocal build_count
         with build_lock:
             build_count += 1
         time.sleep(0.05)
         return _fake_separator()
 
+    _fake_gpu(monkeypatch)
     monkeypatch.setattr(vocal_separation, "_build_separator", fake_build)
     monkeypatch.setattr(
         vocal_separation,
@@ -92,7 +124,7 @@ def test_shared_separator_pool_loads_once_for_concurrent_leases(monkeypatch) -> 
 
     def acquire(index: int):
         barrier.wait()
-        return pool.acquire(f"worker-{index}", "flac", 1, use_amp=True)
+        return pool.acquire(f"worker-{index}", "flac", 1, use_amp=True, device="cuda")
 
     with cf.ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(acquire, index) for index in range(2)]
@@ -115,14 +147,14 @@ def test_shared_separator_pool_loads_once_for_concurrent_leases(monkeypatch) -> 
     assert pool._active_leases == 0
 
 
-def test_non_cuda_acquire_keeps_independent_model(monkeypatch) -> None:
+def test_cpu_acquire_keeps_independent_model(monkeypatch) -> None:
     built = _fake_separator()
 
-    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: False)
+    _fake_gpu(monkeypatch, family=None)
     monkeypatch.setattr(
         vocal_separation,
         "_build_separator",
-        lambda output_dir, output_format, batch_size, *, use_cuda: built,
+        lambda output_dir, output_format, batch_size, *, device: built,
     )
 
     lease = vocal_separation._acquire_separator(
@@ -130,7 +162,7 @@ def test_non_cuda_acquire_keeps_independent_model(monkeypatch) -> None:
         "flac",
         1,
         use_amp=False,
-        use_cuda=False,
+        device="cpu",
     )
 
     assert lease.separator is built
@@ -147,19 +179,18 @@ def test_the_cpu_tier_reaches_the_weights_even_when_the_card_works(
     """`--gpu-tier cpu` is a policy, and a policy that stops at the tier table
     is a label.
 
-    The separator never goes through `resolve_device` -- it asks
-    `cuda_usable()` itself -- so the tier has to be folded into that answer
-    before it reaches `_build_separator`, which is what actually pins
-    audio-separator away from the GPU. Asserted with a **working** card
-    (`cuda_usable()` returns True): that is exactly the case a
-    capability-only check gets wrong, and it would pass with the fold deleted
-    if the card were merely absent.
+    The separator never goes through `resolve_device` -- it asks the device
+    helpers itself -- so the tier has to be folded into that answer before it
+    reaches `_build_separator`, which is what actually pins audio-separator away
+    from the GPU. Asserted with a **working** card (`cuda_usable()` returns
+    True): that is exactly the case a capability-only check gets wrong, and it
+    would pass with the fold deleted if the card were merely absent.
     """
 
-    seen: list[bool] = []
-    def recording_acquire(*args, use_cuda: bool, **kwargs):
-        seen.append(use_cuda)
-        return inner_acquire(*args, use_cuda=use_cuda, **kwargs)
+    seen: list[str] = []
+    def recording_acquire(*args, device: str, **kwargs):
+        seen.append(device)
+        return inner_acquire(*args, device=device, **kwargs)
 
     sample_rate = 8000
     input_path = tmp_path / "input.wav"
@@ -167,12 +198,12 @@ def test_the_cpu_tier_reaches_the_weights_even_when_the_card_works(
     state = {"active": 0, "peak": 0, "calls": 0}
     _install_counting_separator(monkeypatch, state, barrier_parties=1)
     # Captured after the fixture, not before it: this recorder only observes
-    # the `use_cuda` it is handed, so what it wraps has to be the fake the
+    # the `device` token it is handed, so what it wraps has to be the fake the
     # fixture installs. Bound earlier it wraps the genuine `_acquire_separator`,
     # which imports audio-separator and builds real weights -- green only on a
     # machine carrying the [asr] extra, and red everywhere else.
     inner_acquire = vocal_separation._acquire_separator
-    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
+    _fake_gpu(monkeypatch)
     monkeypatch.setattr(vocal_separation, "_acquire_separator", recording_acquire)
     monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 1)
 
@@ -186,7 +217,7 @@ def test_the_cpu_tier_reaches_the_weights_even_when_the_card_works(
         metadata_sink=meta,
     )
 
-    assert seen and not any(seen), "the cpu tier did not reach the separator"
+    assert seen and all(device == "cpu" for device in seen), "the cpu tier did not reach the separator"
     assert meta["device"] == "cpu"
 
     # The control: the same fixture on a GPU tier does ask for the card, so the
@@ -200,7 +231,7 @@ def test_the_cpu_tier_reaches_the_weights_even_when_the_card_works(
         gpu_tier="standard",
         metadata_sink={},
     )
-    assert seen and all(seen)
+    assert seen and all(device == "cuda" for device in seen)
 
 
 def test_an_explicit_cpu_request_keeps_separation_off_a_working_card(
@@ -225,10 +256,10 @@ def test_an_explicit_cpu_request_keeps_separation_off_a_working_card(
         def warning(self, code, message, **kwargs) -> None:  # noqa: D102
             self.codes.append(code)
 
-    seen: list[bool] = []
-    def recording_acquire(*args, use_cuda: bool, **kwargs):
-        seen.append(use_cuda)
-        return inner_acquire(*args, use_cuda=use_cuda, **kwargs)
+    seen: list[str] = []
+    def recording_acquire(*args, device: str, **kwargs):
+        seen.append(device)
+        return inner_acquire(*args, device=device, **kwargs)
 
     sample_rate = 8000
     input_path = tmp_path / "input.wav"
@@ -236,12 +267,12 @@ def test_an_explicit_cpu_request_keeps_separation_off_a_working_card(
     state = {"active": 0, "peak": 0, "calls": 0}
     _install_counting_separator(monkeypatch, state, barrier_parties=1)
     # Captured after the fixture, not before it: this recorder only observes
-    # the `use_cuda` it is handed, so what it wraps has to be the fake the
+    # the `device` token it is handed, so what it wraps has to be the fake the
     # fixture installs. Bound earlier it wraps the genuine `_acquire_separator`,
     # which imports audio-separator and builds real weights -- green only on a
     # machine carrying the [asr] extra, and red everywhere else.
     inner_acquire = vocal_separation._acquire_separator
-    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
+    _fake_gpu(monkeypatch)
     monkeypatch.setattr(vocal_separation, "_acquire_separator", recording_acquire)
     monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 1)
 
@@ -258,7 +289,7 @@ def test_an_explicit_cpu_request_keeps_separation_off_a_working_card(
             metadata_sink=meta,
         )
 
-    assert seen and not any(seen), "an explicit cpu request reached the GPU"
+    assert seen and all(device == "cpu" for device in seen), "an explicit cpu request reached the GPU"
     assert meta["device"] == "cpu"
     # A choice is not a fallback: no "CUDA is unavailable" for a card that is fine.
     assert "cpu-fallback" not in reporter.codes
@@ -274,7 +305,167 @@ def test_an_explicit_cpu_request_keeps_separation_off_a_working_card(
         device=None,
         metadata_sink={},
     )
-    assert seen and all(seen)
+    assert seen and all(device == "cuda" for device in seen)
+
+
+def test_an_intel_gpu_is_named_as_the_separation_device(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """The token has to name the family that runs, not the default one.
+
+    `device=None` is "use the default accelerator", and on this machine that is
+    the Intel GPU. Recording `"cuda"` would make the artefact metadata -- and the
+    support notice derived from it -- describe a CUDA run that never happened.
+    """
+
+    seen: list[str] = []
+    def recording_acquire(*args, device: str, **kwargs):
+        seen.append(device)
+        return inner_acquire(*args, device=device, **kwargs)
+
+    sample_rate = 8000
+    input_path = tmp_path / "input.wav"
+    _write_striped_source(input_path, sample_rate)
+    state = {"active": 0, "peak": 0, "calls": 0}
+    _install_counting_separator(monkeypatch, state, barrier_parties=1)
+    inner_acquire = vocal_separation._acquire_separator
+    _fake_gpu(monkeypatch, family="xpu")
+    # support_levels answers from a real probe; pin the placement it is handed
+    # so the assertion is about the stage rather than about the machine.
+    monkeypatch.setattr(
+        vocal_separation, "note_accelerated_stage", lambda stage, device: device
+    )
+    monkeypatch.setattr(vocal_separation, "_acquire_separator", recording_acquire)
+    monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 1)
+
+    meta: dict = {}
+    vocal_separation.run_vocal_separation(
+        input_path,
+        output_path=tmp_path / "out.flac",
+        block_seconds=0,
+        pad_seconds=0,
+        gpu_tier="standard",
+        metadata_sink=meta,
+    )
+
+    assert seen and all(device == "xpu" for device in seen)
+    assert meta["device"] == "xpu"
+    # fp16 autocast is pending evidence on this card, so the run is fp32: the
+    # metadata must not promise a precision the stage did not use.
+    assert meta["amp"] is False
+
+
+def test_an_unusable_intel_gpu_falls_back_to_cpu_with_the_intel_reason(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """A requested Intel GPU that cannot run is a fallback, and says so.
+
+    The wording matters: "XPU is the default ..." sends the user looking for a
+    product called XPU. The subject is the card they asked for, and the reason
+    is the XPU reason, not the CUDA one.
+    """
+
+    from finesub.reporting import NullReporter, reporting_to
+
+    class _Collect(NullReporter):
+        def __init__(self) -> None:
+            self.messages: list[tuple[str, str]] = []
+
+        def warning(self, code, message, **kwargs) -> None:  # noqa: D102
+            self.messages.append((code, message))
+
+    sample_rate = 8000
+    input_path = tmp_path / "input.wav"
+    _write_striped_source(input_path, sample_rate)
+    state = {"active": 0, "peak": 0, "calls": 0}
+    _install_counting_separator(monkeypatch, state, barrier_parties=1)
+    _fake_gpu(monkeypatch, family=None)
+    monkeypatch.setattr(
+        vocal_separation,
+        "xpu_unusable_reason",
+        lambda: "the driver is missing",
+    )
+    monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 1)
+
+    reporter = _Collect()
+    meta: dict = {}
+    with reporting_to(reporter):
+        vocal_separation.run_vocal_separation(
+            input_path,
+            output_path=tmp_path / "out.flac",
+            block_seconds=0,
+            pad_seconds=0,
+            gpu_tier="standard",
+            device="xpu",
+            metadata_sink=meta,
+        )
+
+    assert meta["device"] == "cpu"
+    assert [code for code, _ in reporter.messages] == ["cpu-fallback"]
+    code, message = reporter.messages[0]
+    assert message == (
+        "the Intel GPU was requested for vocal separation but the driver is "
+        "missing; falling back to CPU."
+    )
+
+
+def test_a_cuda_box_asked_for_the_intel_gpu_falls_back_to_cpu(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Asking for one family must not quietly run the other.
+
+    `--device xpu` on an NVIDIA machine used to mean "any GPU": the stage took
+    the CUDA card and recorded an Intel run. The contract allows the silent
+    substitution only the other way round -- `cuda` is the default and may land
+    on Intel -- so this is a fallback with a warning, not a reprogramming of
+    the run behind the user's back.
+    """
+
+    from finesub.reporting import NullReporter, reporting_to
+
+    class _Collect(NullReporter):
+        def __init__(self) -> None:
+            self.messages: list[tuple[str, str]] = []
+
+        def warning(self, code, message, **kwargs) -> None:  # noqa: D102
+            self.messages.append((code, message))
+
+    sample_rate = 8000
+    input_path = tmp_path / "input.wav"
+    _write_striped_source(input_path, sample_rate)
+    state = {"active": 0, "peak": 0, "calls": 0}
+    _install_counting_separator(monkeypatch, state, barrier_parties=1)
+    _fake_gpu(monkeypatch, family="cuda")
+    monkeypatch.setattr(
+        vocal_separation,
+        "xpu_unusable_reason",
+        lambda: "this machine has no Intel GPU",
+    )
+    monkeypatch.setattr(vocal_separation, "separator_worker_limit", lambda seconds: 1)
+
+    reporter = _Collect()
+    meta: dict = {}
+    with reporting_to(reporter):
+        vocal_separation.run_vocal_separation(
+            input_path,
+            output_path=tmp_path / "out.flac",
+            block_seconds=0,
+            pad_seconds=0,
+            gpu_tier="standard",
+            device="xpu",
+            metadata_sink=meta,
+        )
+
+    assert meta["device"] == "cpu"
+    assert meta["amp"] is False
+    assert [code for code, _ in reporter.messages] == ["cpu-fallback"]
+    assert reporter.messages[0][1] == (
+        "the Intel GPU was requested for vocal separation but this machine has "
+        "no Intel GPU; falling back to CPU."
+    )
 
 
 def test_acquire_pins_autocast_on_the_pooled_clone(monkeypatch) -> None:
@@ -284,13 +475,13 @@ def test_acquire_pins_autocast_on_the_pooled_clone(monkeypatch) -> None:
     master.use_autocast = False
     pool = vocal_separation._SharedSeparatorPool()
 
-    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
+    _fake_gpu(monkeypatch)
     monkeypatch.setattr(vocal_separation.torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(vocal_separation, "_SHARED_SEPARATOR_POOL", pool)
     monkeypatch.setattr(
         vocal_separation,
         "_build_separator",
-        lambda output_dir, output_format, batch_size, *, use_cuda: master,
+        lambda output_dir, output_format, batch_size, *, device: master,
     )
     monkeypatch.setattr(
         vocal_separation,
@@ -299,12 +490,53 @@ def test_acquire_pins_autocast_on_the_pooled_clone(monkeypatch) -> None:
     )
 
     lease = vocal_separation._acquire_separator(
-        "worker", "flac", 1, use_amp=True, use_cuda=True
+        "worker", "flac", 1, use_amp=True, device="cuda"
     )
 
     assert lease.separator is not master
     assert lease.separator.use_autocast is True
     lease.release()
+
+
+def test_a_failed_intel_pin_is_recorded_as_the_cpu_run_it_is(monkeypatch) -> None:
+    """The plan said xpu; the wrapper never left the CPU. The records follow it.
+
+    A version bump that renames what `_build_separator` steers leaves the
+    library on the CPU. Recording the plan would then make the artefact, the
+    support-level notice and the worker count describe a run that never touched
+    the card -- the one thing a user cannot check afterwards.
+    """
+
+    from finesub.reporting import NullReporter, reporting_to
+
+    class _Collect(NullReporter):
+        def __init__(self) -> None:
+            self.messages: list[tuple[str, str]] = []
+
+        def warning(self, code, message, **kwargs) -> None:  # noqa: D102
+            self.messages.append((code, message))
+
+    def announce(*args, **kwargs):  # pragma: no cover - must not be reached
+        raise AssertionError("a CPU landing must not be announced as accelerated")
+
+    monkeypatch.setattr(vocal_separation, "note_accelerated_stage", announce)
+    lease = SimpleNamespace(placement="cpu")
+    meta: dict = {"device": "xpu", "amp": True}
+
+    reporter = _Collect()
+    with reporting_to(reporter):
+        actual = vocal_separation._record_separation_placement(
+            "xpu", lease, metadata_sink=meta, use_amp=True
+        )
+
+    assert actual == "cpu"
+    assert meta["device"] == "cpu"
+    assert meta["amp"] is False
+    assert [code for code, _ in reporter.messages] == ["cpu-fallback"]
+    assert reporter.messages[0][1] == (
+        "vocal separation could not be steered to the Intel GPU; "
+        "running on the CPU."
+    )
 
 
 def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: int):
@@ -321,7 +553,10 @@ def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: in
     class FakeLease:
         accel = vocal_separation._EAGER_ACCEL
 
-        def __init__(self, output_dir: str) -> None:
+        def __init__(self, output_dir: str, *, device: str = "cpu") -> None:
+            # The stage records where the wrapper really landed by reading this
+            # back, so the fake has to say the same thing it was asked for.
+            self.placement = device
             self.separator = SimpleNamespace(
                 output_dir=Path(output_dir),
                 model_instance=object(),
@@ -352,7 +587,7 @@ def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: in
             with counter_lock:
                 state["active"] -= 1
 
-    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
+    _fake_gpu(monkeypatch)
     monkeypatch.setattr(vocal_separation.torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(
         vocal_separation.demix, "separate_waveform", fake_separate_waveform
@@ -365,11 +600,11 @@ def _install_counting_separator(monkeypatch, state: dict, *, barrier_parties: in
         *,
         use_amp,
         accel_backend="eager",
-        use_cuda=True,
+        device: str | None = "cuda",
         sample_rate=vocal_separation.DEFAULT_SEPARATOR_SAMPLE_RATE,
     ):
         state.setdefault("formats", []).append(output_format)
-        return FakeLease(output_dir)
+        return FakeLease(output_dir, device=device or "cpu")
 
     monkeypatch.setattr(vocal_separation, "_acquire_separator", fake_acquire)
     monkeypatch.setattr(
@@ -660,6 +895,7 @@ def test_vocal_separation_releases_shared_lease_after_failure(
 
     class FakeLease:
         accel = vocal_separation._EAGER_ACCEL
+        placement = "cuda"
         separator = SimpleNamespace(model_instance=object(), use_autocast=True)
 
         def release(self) -> None:
@@ -667,10 +903,11 @@ def test_vocal_separation_releases_shared_lease_after_failure(
             released = True
             self.separator = None
 
+    _fake_gpu(monkeypatch)
     monkeypatch.setattr(
         vocal_separation,
         "_acquire_separator",
-        lambda output_dir, output_format, batch_size, *, use_amp, use_cuda=True, accel_backend="eager", sample_rate=44100: (
+        lambda output_dir, output_format, batch_size, *, use_amp, device="cuda", accel_backend="eager", sample_rate=44100: (
             FakeLease()
         ),
     )
@@ -723,7 +960,7 @@ def _jit_pool(monkeypatch, *, warmups: list[str], fail_at: set[int] = frozenset(
     from finesub.speech.preprocessing.separator import accel
 
     pool = vocal_separation._SharedSeparatorPool()
-    monkeypatch.setattr(vocal_separation, "cuda_usable", lambda: True)
+    _fake_gpu(monkeypatch)
     monkeypatch.setattr(vocal_separation.torch.cuda, "empty_cache", lambda: None)
     monkeypatch.setattr(
         vocal_separation, "_build_separator", lambda *a, **k: _fake_separator()
@@ -762,7 +999,7 @@ def test_jit_is_exercised_once_before_any_block_runs(monkeypatch) -> None:
     warmups: list[str] = []
     pool, reverted = _jit_pool(monkeypatch, warmups=warmups)
 
-    lease = pool.acquire("w", "flac", 1, use_amp=True, accel_backend="jit")
+    lease = pool.acquire("w", "flac", 1, use_amp=True, accel_backend="jit", device="cuda")
 
     # Eager warm-up (rotary cache), then the compiled one that triggers the
     # lazy torch.compile. Nothing to revert.
@@ -780,7 +1017,7 @@ def test_jit_first_forward_failure_reverts_and_the_run_continues_on_eager(
     warmups: list[str] = []
     pool, reverted = _jit_pool(monkeypatch, warmups=warmups, fail_at={2})
 
-    lease = pool.acquire("w", "flac", 1, use_amp=True, accel_backend="jit")
+    lease = pool.acquire("w", "flac", 1, use_amp=True, accel_backend="jit", device="cuda")
 
     # eager warm-up, compiled warm-up (fails), eager warm-up again on the
     # reverted model -- and the lease carries the reason.
@@ -804,7 +1041,7 @@ def test_eager_failure_after_revert_is_the_models_problem_and_propagates(
     pool, reverted = _jit_pool(monkeypatch, warmups=warmups, fail_at={2, 3})
 
     with pytest.raises(RuntimeError, match="forward 3 failed"):
-        pool.acquire("w", "flac", 1, use_amp=True, accel_backend="jit")
+        pool.acquire("w", "flac", 1, use_amp=True, accel_backend="jit", device="cuda")
 
     assert len(reverted) == 1
     assert pool._master is None
@@ -815,6 +1052,6 @@ def test_aoti_and_eager_do_not_pay_a_second_warm_up(monkeypatch) -> None:
     for backend in ("aoti", "eager"):
         warmups: list[str] = []
         pool, _ = _jit_pool(monkeypatch, warmups=warmups)
-        lease = pool.acquire("w", "flac", 1, use_amp=True, accel_backend=backend)
+        lease = pool.acquire("w", "flac", 1, use_amp=True, accel_backend=backend, device="cuda")
         assert warmups == ["warm"]
         assert lease.accel.effective == backend

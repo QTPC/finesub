@@ -34,7 +34,7 @@ from ..runtime.resources import (
 )
 from ..runtime.cuda_libs import missing_asr_backend_message
 from ..runtime.gpu_stage_gate import GPU_STAGE_GATE, GpuStageLease
-from ..runtime.device import resolve_asr_device
+from ..runtime.device import is_gpu_device, resolve_asr_device
 from ..runtime.support_levels import note_accelerated_stage
 from ..runtime import hf_weights, phase_timing
 from ..runtime import stall_watchdog
@@ -58,7 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", help="Path to vocal audio.")
     parser.add_argument("--output", help="Path to output JSON.")
     parser.add_argument("--model", default=asr_align.DEFAULT_MODEL, help="Whisper model name.")
-    parser.add_argument("--device", default="cuda", help="Device override (cpu/cuda).")
+    parser.add_argument("--device", default="cuda", help="Device override (cpu/cuda/xpu).")
     parser.add_argument(
         "--gpu-tier",
         choices=gpu_tier_cli_choices(),
@@ -999,7 +999,10 @@ def referee_warm_device(
         pool_resident=True,
         live_vram_veto=veto,
     )
-    return placed if placed.strip().lower().startswith("cuda") else None
+    # `referee_device` answers for torch, so its token can be the Intel card;
+    # a token test written against "cuda" would silently drop that warm-up and
+    # the `warmed_under_decode` evidence with it.
+    return placed if is_gpu_device(placed) else None
 
 
 class RefereeWarm:

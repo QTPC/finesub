@@ -141,7 +141,7 @@ pytest 的 `tmp_path` / `tmp_path_factory.mktemp` 都走 `make_numbered_dir`，�
 | 守什么 | 文件 | 出错时长什么样 |
 | --- | --- | --- |
 | 导入方向（media/subtitles 不向上依赖、`speech` 不依赖 `llm`、别处不得 import `finesub.pipeline`） | `test_import_boundaries.py` | import 照常成功，分层悄悄没了 |
-| **「这台机器有什么 GPU」只在 `speech/runtime/device.py` 问 torch**（`is_available`、`get_device_*`、`torch.version.cuda/hip`、`torch.backends.mps`、`torch.xpu` 等；用卡的调用如 `empty_cache` 不算） | `test_import_boundaries.py` 的 `test_device_probes_live_in_one_module` | 一处裸 `is_available()` 把活放上没有内核的卡；AMD 卡被当成 NVIDIA |
+| **「这台机器有什么 GPU」只在 `speech/runtime/device.py` 问 torch**（`is_available`、`get_device_*`、`torch.version.cuda/hip/xpu`、`torch.backends.mps`、`torch.xpu.*` 等；用卡的调用如 `empty_cache` 不算，但 `torch.xpu` 整棵子模块例外——守卫按模块前缀整条挡住，XPU 的探测与调用都走 `device.py` 的 helper） | `test_import_boundaries.py` 的 `test_device_probes_live_in_one_module` | 一处裸 `is_available()` 把活放上没有内核的卡；AMD 卡被当成 NVIDIA；Intel 卡被当成一块 `cuda` 设备 |
 | **ASR 解码选项只在 `asr_backend.DECODE_OPTIONS` 声明**，`transcribe.py` 不得内联拼选项名；每个注册的后端正好接受它能力对应的那一组 | `test_asr_backend_contract.py`（含一个故意写坏的第二后端，证明守卫会红） | 加了选项，只实现了 CT2 的后端悄悄忽略它，在没人跑 CI 的硬件上走另一条路 |
 | **`torch.jit.load` 只在 `speech/runtime/native_paths.py` 调**，别处用它的 `load_torchscript`（传文件对象） | `test_import_boundaries.py` 的 `test_torchscript_loads_go_through_one_helper` | UTF-8 代码页的机器上一切正常；中文 Windows（GBK）上装在中文路径下时，libtorch 的窄字符 `fopen` 报「文件不存在」——0.5.1 的 silero 报错就是这样 |
 | **依赖锁里的环境标记只能是目标平台（64 位 Windows 上的 CPython）恒为真的那几种** | `test/bootstrap/test_runtime_health.py` 的 `test_every_lock_marker_is_true_on_the_target_platform` | 运行环境的快检不求值标记：一个在目标平台为假的标记会让那个包被当成「整个包不见了」，重建又装不上它，于是每次运行都停在重建上 |

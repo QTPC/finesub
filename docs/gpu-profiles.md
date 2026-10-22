@@ -69,21 +69,22 @@ torch 装成了不带 GPU 支持的构建（`[asr]` 盖掉 ROCm 版 torch 就是
 那种情况 `resolve_device` 的每阶段回退告警已经说过了。探测只用标准库，且**不问 torch**——它正是在 torch 说没有设备时才被调用的。
 ⚠ Windows 侧问的是 `EnumDisplayDevicesW`（当前接着的适配器），**不是驱动类注册表**：后者给每张
 装过的卡留一个子键，本机至今还列着 2026-08 拆掉的 5060 Ti，照它报会让换过卡的机器永远收到这条提示。
-Linux 读 `/sys` 里 PCI class 0x03 的 vendor，本来就只有在场设备。Intel 有意不报：目前没有阶段用得上
-I 卡。显式 `--device cpu` 时也不报——那是用户自己的决定（owner 2026-09-17）。
+Linux 读 `/sys` 里 PCI class 0x03 的 vendor，本来就只有在场设备。Intel 卡自 2026-10-22 起会报：
+分离器与语言重解的 Qwen 裁判用得上它（见下面「Intel（XPU，2026-10-22）」），识别不用，但那条 `cpu-fallback` 告警自己会说。
+显式 `--device cpu` 时也不报——那是用户自己的决定（owner 2026-09-17）。
 
 ✱ **每个 torch 阶段问 torch，别问 CTranslate2。** 2026-09-17 复审查出 silero 辅助收到的是**解析后的
 ASR 设备**，于是 A 卡上 CT2 回退 CPU 之后，这个 torch 模型也被按到 CPU——把两个后端的答案合并了一次。
 现在 `run_vad_prefix` 收到的是**请求**设备（叠上 `profile.gpu`），能力那一问由 `resolve_silero_device`
 交给 torch。裁判早就是这么做的（`lang_redecode.referee_device` 的第 3 问），分离器也是。
 
-✱ **策略必须真的到得了权重。** 分离器不走 `resolve_device`，它自己问 `cuda_usable()`，
+✱ **策略必须真的到得了权重。** 分离器不走 `resolve_device`，它自己问 `cuda_usable() or xpu_usable()`，
 所以 `run_vocal_separation` 把意图、策略与能力**折叠一次**（`--device` 的请求 ∧
-`resource_profile.gpu` ∧ `cuda_usable()`；2026-09-02 复审补上第一项——此前 `--device cpu`
+`resource_profile.gpu` ∧（`cuda_usable()` 或 `xpu_usable()`）；2026-09-02 复审补上第一项——此前 `--device cpu`
 管不到分离，`--gpu-tier standard --device cpu` 仍先在卡上分离）
 再往下传，`_build_separator` 收到的是决定而不是半个问题。一个到不了这里的 `cpu` 档只是个
 标签——`test_the_cpu_tier_reaches_the_weights_even_when_the_card_works` 用**能用的显卡**
-钉住这一条（卡是好的、`cuda_usable()` 为真，仍必须落 CPU），删掉那次折叠它就红。
+钉住这一条（卡是好的、能力检查为真，仍必须落 CPU），删掉那次折叠它就红。
 
 **`--gpu-tier cpu --device cuda` 直接报错**：两者没有同时成立的读法，静默选一边就是下一个
 静默错配。检查放在 `pipeline.py` 的 `_pipeline_kwargs`——那是唯一分得清「用户要了 cuda」
@@ -184,7 +185,7 @@ Separator 的 `batch_size` 在当前依赖中无效，固定为 1；“实例数
 ## 厂商：AMD 与 Apple（2026-09-17）
 
 档位按显存命名，本来就与厂商无关；「这台机器是哪家的卡」只在 `speech/runtime/device.py` 回答
-（`accelerator()`、`is_rocm()`），各阶段只拿回答。用户向的说明在 `docs/manual/resources.md`「AMD 显卡」。
+（`accelerator()`、`is_rocm()`、`is_xpu()`），各阶段只拿回答。用户向的说明在 `docs/manual/resources.md`「AMD 显卡」与「Intel 显卡」。
 
 - **AMD（ROCm 版 PyTorch）**：它沿用 `torch.cuda` 与 `cuda` 设备名，所以定档、显存读数、各阶段的
   放置都照走 NVIDIA 那条代码。`device.py` 里不同的有三处：内核判断是 `gfx` 目标**是否在列表里**
@@ -199,6 +200,35 @@ Separator 的 `batch_size` 在当前依赖中无效，固定为 1；“实例数
 - **Apple（MPS）**：`accelerator()` 能认出来，但目前没有阶段用它，`auto` 在 Mac 上落 `cpu` 档。等 MPS 的
   阶段接上时，`auto` 固定落 `standard`（统一内存报不出「显存」，owner 2026-09-11 定），届时验收要记一组
   分离 1 实例对 2 实例的吞吐。
+
+## Intel（XPU，2026-10-22）
+
+Intel 卡走自己的设备名 `xpu`：`accelerator()` 认 `intel`，其余阶段只拿 `gpu_device()` / `is_gpu_device()`
+的令牌，不直接问 `torch.xpu`（守卫同上）。`warn_if_an_installed_card_is_unused()` 自 2026-10-22 起报 Intel 卡：
+以前有意不报，是因为没有任何阶段用得上 I 卡；现在分离器与语言重解的 Qwen 裁判用得上，所以报。真正会触发它的是
+「有 Intel 卡、但当前 torch / 驱动用不上它」——装的是 CUDA 版 torch、驱动过旧，或者 `ZE_AFFINITY_MASK`
+把卡屏蔽了；忘了带 `--device xpu` 不会触发，那种情况下 `resolve_device` 已经静默把活放到了 Intel 卡上。
+action 指向 `docs/manual/repo-install.md`「Intel 显卡」。
+
+- **定档**：`auto` 在 Intel 上封顶 `standard`，**不分核显/独显**——`gpu_device() == "xpu"` 就压到 `standard`。
+  核显的「显存」是驱动报的共享系统内存，不是可独占的容量；`standard_large_vram` 多出来的那一截是给 Qwen
+  的编译版预留 3.5 GiB **独占**显存用的，这个前提在共享内存上不成立。Arc 独显也没有在 `standard` 以上标定过，
+  所以报出的总量再大也不放行更大的档位。显式 `--gpu-tier` 仍按用户说的来，没跟着这个上限走。
+- **谁上卡**：分离器与语言重解的 Qwen 裁判（torch 侧，`lang_redecode.referee_device`）；识别由 CTranslate2
+  决定，而 CTranslate2 没有 Intel GPU 后端，所以它留在 CPU，`resolve_asr_device` 输出 `cpu-fallback` 告警——
+  「每个阶段各问各的后端」这条设计第一次碰到一家厂商只被其中一个后端支持的情况。
+  **`--qwen-verify` 的尾段二次校验不在名单里**：`tail_verify_device` 按解析后的识别设备派生，Intel 上落
+  CPU + float32——换设备就是换数值路径（CPU-float32 对 GPU-bf16 在 `asr-align.md`「待标定」里还没量过），
+  2026-09-04 那次 reroute 的撤回对它同样有效。`_diarization_device` 在 XPU 上同样返回 cpu。
+- **编译**：AOTI 仍 CUDA-only；XPU 与 ROCm 同路（放弃 AOTI，走 eager/JIT），Windows 上也没有 triton-xpu，
+  不启用 inductor。裁判 `auto` 不编译，理由同 AMD：失败会当场退回动态，但 3.5 GiB 的定形解码另占显存，
+  在没验收过的运行时上默认打开风险不对称。
+- **实测（Arc 130T，2026-10-22）**：`torch.version.xpu == "20250302"`（torch 2.11.0+xpu）；`total_memory` 报
+  16.44 GiB，是共享系统内存，不是独占显存；Arc 独显也没有在 `standard` 以上标定过——这是 `auto` 封顶
+  `standard` 的另一半理由。`is_bf16_supported()` 为真，所以上卡的 inline 裁判在 Intel 上直接走 bf16，不降 float32
+  （尾段那次留在 CPU，用 float32）。
+- **没标定**：档位数字与 worker 数都没有在 Intel 卡上标定过（本机只有一张 Arc 130T，16GB 共享内存），
+  支持等级是实验；分离两实例对单实例的吞吐要等验收记录带回来。
 
 ## `auto` 怎么定档（0.5.0 起的默认）
 
